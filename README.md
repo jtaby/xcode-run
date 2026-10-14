@@ -40,8 +40,9 @@ This installs two names for the same command: `run` and `xcode-run`. Use
 In a git repository with an iOS app:
 
 ```sh
-run          # pick a destination, then build, run, and show the console
-run setup    # answer the setup questions again
+run             # pick a destination, then build, run, and show the console
+run --no-build  # run the last build again on the same destination
+run setup       # answer the setup questions again
 run --help
 run --version
 ```
@@ -89,8 +90,22 @@ app's output, newest line at the bottom.
 | Down, PgDn, End | Scroll forward. On the newest line, the view follows new lines again. |
 | Ctrl-Y | Copy the lines that match the filter (or the full log) to the clipboard. |
 | Ctrl-S | Save the same lines to a file on your Desktop. |
+| Ctrl-R | Stop the app and launch the same build again, without building or installing it. |
 | Ctrl-C | Stop the app and end the session. |
 | ? | Show all of the keys. |
+
+### Run again without building
+
+To launch the app again without building it, press Ctrl-R in the console. `run`
+stops the app and launches the copy that the destination already has. The new
+output goes on in the same console, under a `── Relaunching ──` line, and the
+filter stays.
+
+To start a new session without building, use `run --no-build`. It launches
+the last build of the worktree on the destination that it was built for,
+without the list. On an iPhone, an iPad, or a simulator, it installs the build
+first, because another worktree can install a different build of the same app
+there.
 
 ### Locked devices
 
@@ -100,6 +115,9 @@ notification and rings the terminal bell, so you know that it's waiting.
 The notification uses OSC 777, which terminals such as
 [Ghostty](https://ghostty.org) support. In tmux, the notification gets through
 only if `allow-passthrough` is on.
+
+Ctrl-R in the console doesn't wait. If the device is locked, the app keeps
+running, and the console asks you to unlock the device and press Ctrl-R again.
 
 ## Settings
 
@@ -118,7 +136,8 @@ track them. You can also edit the file:
 | `derived_data` | The build folder, relative to the worktree root. By default, `DerivedData-CommandLine` next to the project. Make sure git ignores it. |
 
 The build folder also keeps `last-build.log` (all `xcodebuild` output),
-`last-build-progress.log`, and `last-console.log` (all app output).
+`last-build-progress.log`, `last-console.log` (all app output), and `last-run`
+(the last build and its destination, for `run --no-build`).
 
 ## Environment
 

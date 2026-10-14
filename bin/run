@@ -5,6 +5,8 @@
 #   run            Pick where to run the app: this Mac (with Mac Catalyst), a
 #                  connected iPhone or iPad, or an iOS simulator. Then build the
 #                  app, run it there, and show its console.
+#   run --no-build Run the last build of the worktree again, on the same
+#                  destination, and show its console.
 #   run setup      Answer the setup questions for the repository again.
 #   run --help     Show the commands. --version shows the version.
 #
@@ -27,6 +29,7 @@
 # The app gets the launch arguments and environment variables that its scheme
 # enables in Xcode. The console shows all of its output, newest at the bottom,
 # and keeps it in last-console.log in the build folder. Type to filter it.
+# Ctrl-R stops the app and launches the same build again, in the same console.
 # Press ? in the console for all of its keys, which _run_help lists.
 #
 # An app cannot launch on a locked iPhone or iPad. If the device is locked when
@@ -67,6 +70,9 @@ RUN_LAST_DESTINATION=${XDG_CACHE_HOME:-$HOME/.cache}/xcode-run/last-destination
 RUN_CONFIG_NAME=xcode-run.conf
 # Default name of the build folder, next to the Xcode workspace or project.
 RUN_DERIVED_NAME=DerivedData-CommandLine
+# Name of the file in the build folder that records the last build and its
+# destination, for run --no-build.
+RUN_LAST_RUN_NAME=last-run
 # Folder levels under the worktree root that setup searches for Xcode
 # workspaces and projects.
 RUN_PROJECT_SEARCH_DEPTH=3
@@ -740,6 +746,20 @@ _run_pick() {
   mkdir -p ${RUN_LAST_DESTINATION:h} && print -r -- $RUN_ID > $RUN_LAST_DESTINATION
 }
 
+# _run_last_run
+# Sets RUN_KIND, RUN_ID, RUN_NAME, and RUN_APP to the last build of the
+# worktree and its destination, which run records in RUN_LAST_RUN_NAME.
+_run_last_run() {
+  local file=$RUN_DERIVED/$RUN_LAST_RUN_NAME
+  local -a fields
+  [[ -r $file ]] && fields=("${(@ps:\t:)$(<$file)}")
+  if (( $#fields != 4 )); then
+    print -u2 "No build to run again in ${RUN_ROOT:t} yet. Build and run it with: $RUN_COMMAND"
+    return 1
+  fi
+  RUN_KIND=$fields[1] RUN_ID=$fields[2] RUN_NAME=$fields[3] RUN_APP=$RUN_DERIVED/$fields[4]
+}
+
 # _run_scheme_launch
 # Sets RUN_APP_ARGS and RUN_APP_ENV (NAME=value items) to the launch arguments
 # and environment variables that the scheme enables, so the app runs like it
@@ -811,13 +831,19 @@ _run_wait_for_unlock() {
   print -u2 "$RUN_NAME unlocked after $REPLY"
 }
 
-# _run_launch <app> <log>
+# _run_launch <app> <log> [relaunch]
 # Installs the app on the destination if necessary. Then starts it in the
 # background, in a process group of its own, and writes all of its output to
 # the log. Sets REPLY to the process group ID. The group ends when the app ends.
+# With relaunch, it starts the copy that the destination has already: it does
+# not install the app or wait for a locked device, and it adds to the log.
 _run_launch() {
-  local app=$1 log=$2 bundle_id executable
+  local app=$1 log=$2 mode=$3 bundle_id executable
   local -a command
+  if [[ ! -d $app ]]; then
+    print -u2 "No ${app#$PWD/}. Build it with: $RUN_COMMAND"
+    return 1
+  fi
   _run_scheme_launch
 
   # NSUnbufferedIO=YES makes Foundation write print() output immediately, as
@@ -833,9 +859,11 @@ _run_launch() {
       ;;
     device)
       bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' $app/Info.plist)
-      print -u2 "Installing on $RUN_NAME"
-      xcrun devicectl device install app --device $RUN_ID $app >/dev/null || return 1
-      _run_wait_for_unlock
+      if [[ $mode != relaunch ]]; then
+        print -u2 "Installing on $RUN_NAME"
+        xcrun devicectl device install app --device $RUN_ID $app >/dev/null || return 1
+        _run_wait_for_unlock
+      fi
       # devicectl removes the DEVICECTL_CHILD_ prefix and gives the variables
       # to the app. It sends the signals that it gets to the app.
       command=(env NSUnbufferedIO=YES DEVICECTL_CHILD_NSUnbufferedIO=YES ${RUN_APP_ENV/#/DEVICECTL_CHILD_}
@@ -847,8 +875,10 @@ _run_launch() {
       print -u2 "Starting $RUN_NAME"
       xcrun simctl bootstatus $RUN_ID -b >/dev/null || return 1
       _run_show_simulators
-      print -u2 "Installing on $RUN_NAME"
-      xcrun simctl install $RUN_ID $app || return 1
+      if [[ $mode != relaunch ]]; then
+        print -u2 "Installing on $RUN_NAME"
+        xcrun simctl install $RUN_ID $app || return 1
+      fi
       # simctl removes the SIMCTL_CHILD_ prefix and gives the variables to the
       # app. It sends the signals that it gets to the app.
       command=(env NSUnbufferedIO=YES SIMCTL_CHILD_NSUnbufferedIO=YES ${RUN_APP_ENV/#/SIMCTL_CHILD_}
@@ -857,7 +887,7 @@ _run_launch() {
   esac
 
   print -u2 "Launching $RUN_APP_NAME on $RUN_NAME"
-  : > $log
+  [[ $mode == relaunch ]] || : > $log
   # simctl --console stops following the app at the end of its input, so the
   # input must stay open. The terminal is not a possible input, because the
   # console reads the keys from it. The launch command opens this pipe for both
@@ -904,8 +934,15 @@ _run_console() {
   local resume='transform:(( FZF_POS == 1 )) && [[ $FZF_PROMPT == *paused* ]] && print "toggle-track+change-prompt:Filter: "'
   # ? shows the help when the filter is empty. In a filter, it is a character.
   local help="transform:[[ -n \$FZF_QUERY ]] && print 'put(?)' || print 'execute($again _help)'"
-  local keys='?: help · ctrl-y: copy · ctrl-s: save to a file · end: newest line · ctrl-c: stop app'
-  RUN_LOG=$log RUN_TITLE=$title RUN_APP_NAME=$RUN_APP_NAME FZF_DEFAULT_COMMAND="tail -n +1 -F ${(q)log}" fzf \
+  local keys='?: help · ctrl-r: relaunch · ctrl-y: copy · ctrl-s: save · end: newest line · ctrl-c: stop app'
+  # The keys that run this script again get the session from these variables.
+  local -a session=(
+    RUN_LOG=$log RUN_TITLE=$title RUN_SESSION=$RUN_SESSION
+    RUN_APP=$RUN_APP RUN_APP_NAME=$RUN_APP_NAME
+    RUN_KIND=$RUN_KIND RUN_ID=$RUN_ID RUN_NAME=$RUN_NAME
+    RUN_ROOT=$RUN_ROOT RUN_PROJECT=$RUN_PROJECT RUN_SCHEME=$RUN_SCHEME RUN_DERIVED=$RUN_DERIVED
+  )
+  env $session FZF_DEFAULT_COMMAND="tail -n +1 -F ${(q)log}" fzf \
     --with-shell='zsh -fc' \
     --tac --no-sort --exact --tail=$RUN_CONSOLE_LINES --wrap --no-multi \
     --prompt='Filter: ' --info=inline-right --ghost='words, !hidden, a | b' \
@@ -918,6 +955,8 @@ _run_console() {
     --bind="page-down:page-down+$resume" \
     --bind="scroll-down:down+$resume" \
     --bind="end:first+$resume" \
+    --bind="ctrl-r:first+$resume" \
+    --bind="ctrl-r:+bg-transform-footer:$again _relaunch" \
     --bind="?:$help" \
     --bind="ctrl-y:transform-footer:$again _export copy {*f}" \
     --bind="ctrl-s:transform-footer:$again _export save {*f}"
@@ -956,6 +995,41 @@ _run_export() {
   print -r -- "$RUN_TITLE · $report"
 }
 
+# _run_relaunch
+# Runs from the console's Ctrl-R, in the background. Stops the app and launches
+# the same build again on the same destination, without building or installing
+# it. The new output goes on in the same log, and the group file of the session
+# gets the new process group. Prints the console title with a short report, for
+# the fzf footer.
+_run_relaunch() {
+  local report
+  # One relaunch at a time. The lock ends when this process ends, and run
+  # waits for it before it stops the app.
+  zmodload -F zsh/system b:zsystem
+  if ! zsystem flock -t 0 $RUN_SESSION/lock 2>/dev/null; then
+    print -r -- "$RUN_TITLE · Already relaunching $RUN_APP_NAME"
+    return
+  fi
+  # All messages go to the log. The app must not get the output of this
+  # command, or fzf waits until the app ends.
+  {
+    # Check first, so the app keeps running if it cannot launch again now.
+    if [[ $RUN_KIND == device ]] && _run_device_locked; then
+      report="$RUN_NAME is locked. Unlock it, then press Ctrl-R."
+    else
+      _run_stop $(<$RUN_SESSION/group)
+      print -r -- "── Relaunching $RUN_APP_NAME ──"
+      if _run_launch $RUN_APP $RUN_LOG relaunch; then
+        print -r -- $REPLY > $RUN_SESSION/group
+        report="Relaunched $RUN_APP_NAME at $(date +%H:%M:%S)"
+      else
+        report="$RUN_APP_NAME did not launch. The console shows why."
+      fi
+    fi
+  } </dev/null >> $RUN_LOG 2>&1
+  print -r -- "$RUN_TITLE · $report"
+}
+
 # _run_help
 # Runs from the console's ? key. Shows the console keys on the full terminal
 # until the user presses a key.
@@ -978,6 +1052,8 @@ _run_help() {
   ${bold}Ctrl-Y${plain}        Copy the lines that match the filter to the clipboard.
                 With no filter, copy the full log.
   ${bold}Ctrl-S${plain}        Save the same lines to a file in ${RUN_SAVE_DIR/#$HOME/~}.
+  ${bold}Ctrl-R${plain}        Stop the app and launch the same build again, without
+                building or installing it. Its output goes on below.
   ${bold}Ctrl-C${plain}        Stop the app and end the session.
   ${bold}?${plain}             Show this help. In a filter, ? is a usual character.
 
@@ -1015,6 +1091,7 @@ _run_check_tools() {
 _run_usage() {
   local -a commands=(
     '' 'Pick a destination, then build, run, and show the console.'
+    --no-build 'Run the last build again on the same destination.'
     setup 'Answer the setup questions for this repository again.'
     --help 'Show this help.'
     --version 'Show the version.'
@@ -1051,6 +1128,10 @@ run_setup() {
   }
 }
 
+# run [--no-build]
+# Builds the app for a destination that the user picks, or with --no-build
+# takes the last build and its destination. Then launches the app there and
+# shows its console.
 run() {
   if [[ ! -t 0 || ! -t 1 ]]; then
     print -u2 "$RUN_COMMAND needs a terminal"
@@ -1058,26 +1139,47 @@ run() {
   fi
   _run_check_tools || return 1
   _run_setup || return 1
-  # Esc in the list cancels without an error.
-  _run_pick || return 0
 
-  case $RUN_KIND in
-    mac) _run_build maccatalyst 'platform=macOS,variant=Mac Catalyst' 'Mac Catalyst' ;;
-    device) _run_build iphoneos 'generic/platform=iOS' iOS ;;
-    simulator)
-      # Boot the simulator while the app builds.
-      xcrun simctl boot $RUN_ID >/dev/null 2>&1 &!
-      _run_build iphonesimulator 'generic/platform=iOS Simulator' 'iOS Simulator'
-      ;;
-  esac || return 1
-  local app=$REPLY log=$RUN_DERIVED/last-console.log
+  if [[ $1 == --no-build ]]; then
+    _run_last_run || return 1
+  else
+    # Esc in the list cancels without an error.
+    _run_pick || return 0
+    case $RUN_KIND in
+      mac) _run_build maccatalyst 'platform=macOS,variant=Mac Catalyst' 'Mac Catalyst' ;;
+      device) _run_build iphoneos 'generic/platform=iOS' iOS ;;
+      simulator)
+        # Boot the simulator while the app builds.
+        xcrun simctl boot $RUN_ID >/dev/null 2>&1 &!
+        _run_build iphonesimulator 'generic/platform=iOS Simulator' 'iOS Simulator'
+        ;;
+    esac || return 1
+    RUN_APP=$REPLY
+    local -a record=($RUN_KIND $RUN_ID $RUN_NAME ${RUN_APP#$RUN_DERIVED/})
+    print -r -- ${(pj:\t:)record} > $RUN_DERIVED/$RUN_LAST_RUN_NAME
+  fi
+  local log=$RUN_DERIVED/last-console.log
 
-  _run_launch $app $log || return 1
+  _run_launch $RUN_APP $log || return 1
   local group=$REPLY
+  # Ctrl-R in the console launches the app again, in a new process group. The
+  # session folder keeps the ID of the group that runs now, and the lock that
+  # a relaunch holds while it runs.
+  RUN_SESSION=$(mktemp -d -t xcode-run-session) || {
+    _run_stop $group
+    return 1
+  }
+  print -r -- $group > $RUN_SESSION/group
+  : > $RUN_SESSION/lock
   # Closing the terminal also stops the app.
-  trap "_run_stop $group; exit 1" HUP TERM
+  trap '_run_stop $(<$RUN_SESSION/group); rm -rf $RUN_SESSION; exit 1' HUP TERM
   _run_console $log "${RUN_ROOT:t} on $RUN_NAME"
 
+  # Wait for a relaunch to finish, so the group is the one that runs now.
+  zmodload -F zsh/system b:zsystem
+  zsystem flock -t $RUN_STOP_GRACE $RUN_SESSION/lock 2>/dev/null
+  group=$(<$RUN_SESSION/group)
+  rm -rf $RUN_SESSION
   if kill -0 -- -$group 2>/dev/null; then
     _run_stop $group
     print -u2 "Stopped $RUN_APP_NAME on $RUN_NAME"
@@ -1091,10 +1193,12 @@ run() {
 if [[ $ZSH_EVAL_CONTEXT == toplevel ]]; then
   case $1 in
     '') run ;;
+    --no-build) run --no-build ;;
     setup) run_setup ;;
     -h|--help|help) _run_usage ;;
     -v|--version|version) _run_version ;;
     _export) shift; _run_export "$@" ;;
+    _relaunch) _run_relaunch ;;
     _help) _run_help ;;
     *)
       _run_usage >&2
