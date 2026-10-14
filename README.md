@@ -94,6 +94,33 @@ app's output, newest line at the bottom.
 | Ctrl-C | Stop the app and end the session. |
 | ? | Show all of the keys. |
 
+### Crashes
+
+If the app crashes, the console shows what happened below the app's last
+lines: the exception, and the stack of the thread that crashed (or the
+backtrace of an uncaught exception), with source lines. The stack ends after
+its last frame in the app.
+
+```
+── MyApp crashed: EXC_BAD_ACCESS (SIGSEGV) · KERN_INVALID_ADDRESS at 0x0000000000000010 ──
+Thread 0 crashed · com.apple.main-thread
+  0  MyApp              PhotoLoader.decode(_:) (PhotoLoader.swift:42)
+  1  MyApp              PhotoLoader.load(_:) (PhotoLoader.swift:18)
+  2  libdispatch.dylib  _dispatch_client_callout + 16
+  …
+Crash report: ~/Library/Logs/DiagnosticReports/MyApp-2026-10-14-160138.ips
+```
+
+`run` takes the summary from the crash report that the destination writes. It
+comes a few seconds after the crash on the Mac and in a simulator, and can take
+up to about 15 seconds from an iPhone or iPad. A report from a device has no
+source lines, so `run` looks them up in the build with `atos`. `run` copies
+reports from devices to `crash-reports` in the build folder. Open a report in
+Console to see all of its threads.
+
+If iOS ends the app on a device because of its memory use, the console shows
+that and how much memory the app used. That leaves no stack.
+
 ### Run again without building
 
 To launch the app again without building it, press Ctrl-R in the console. `run`
@@ -136,8 +163,9 @@ track them. You can also edit the file:
 | `derived_data` | The build folder, relative to the worktree root. By default, `DerivedData-CommandLine` next to the project. Make sure git ignores it. |
 
 The build folder also keeps `last-build.log` (all `xcodebuild` output),
-`last-build-progress.log`, `last-console.log` (all app output), and `last-run`
-(the last build and its destination, for `run --no-build`).
+`last-build-progress.log`, `last-console.log` (all app output), `last-run`
+(the last build and its destination, for `run --no-build`), and
+`crash-reports` (the crash reports that `run` copies from devices).
 
 ## Environment
 

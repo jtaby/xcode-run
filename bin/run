@@ -32,6 +32,11 @@
 # Ctrl-R stops the app and launches the same build again, in the same console.
 # Press ? in the console for all of its keys, which _run_help lists.
 #
+# If the app crashes, the console shows a summary of the crash report that the
+# destination writes: how the app ended, and the stack of the thread that
+# crashed, with source lines. On a device, it also shows when iOS ended the app
+# because of its memory use, which leaves no stack.
+#
 # An app cannot launch on a locked iPhone or iPad. If the device is locked when
 # the app is ready, the script waits until you unlock it. It shows a desktop
 # notification and rings the terminal bell, so you know that it waits.
@@ -58,6 +63,21 @@ RUN_PAGER_PROMPT='Build output so far\. q\: back to the build, G\: newest lines,
 
 # Most lines that the console keeps for filtering. The log file keeps all lines.
 RUN_CONSOLE_LINES=200000
+# Seconds that the console waits for the crash report of an app that ended on
+# its own. On a device, a look at the crash reports and a copy of one each take
+# 1 to 10 seconds.
+RUN_CRASH_WAIT=30
+# Seconds between looks for a crash report.
+RUN_CRASH_POLL=0.5
+# Most stack frames that the console shows for a crash. It stops after the last
+# frame in the app. The crash report has all of them.
+RUN_CRASH_FRAMES=40
+# Seconds that the clock of a device can be behind the clock of this Mac.
+RUN_CLOCK_SLACK=2
+# Folder of the crash reports of this Mac, which also has those of simulators.
+RUN_MAC_REPORTS=$HOME/Library/Logs/DiagnosticReports
+# Name of the folder in the build folder for crash reports from devices.
+RUN_DEVICE_REPORTS_NAME=crash-reports
 # Folder for the console lines that Ctrl-S saves. XCODE_RUN_SAVE_DIR in the
 # environment can change it.
 RUN_SAVE_DIR=${XCODE_RUN_SAVE_DIR:-$HOME/Desktop}
@@ -837,20 +857,23 @@ _run_wait_for_unlock() {
 # the log. Sets REPLY to the process group ID. The group ends when the app ends.
 # With relaunch, it starts the copy that the destination has already: it does
 # not install the app or wait for a locked device, and it adds to the log.
+# If the app ends on its own, _run_crash_report adds its crash to the log.
 _run_launch() {
-  local app=$1 log=$2 mode=$3 bundle_id executable
+  local app=$1 log=$2 mode=$3 plist=$1/Info.plist bundle_id executable
   local -a command
   if [[ ! -d $app ]]; then
     print -u2 "No ${app#$PWD/}. Build it with: $RUN_COMMAND"
     return 1
   fi
   _run_scheme_launch
+  [[ $RUN_KIND == mac ]] && plist=$app/Contents/Info.plist
+  bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' $plist)
+  executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' $plist)
 
   # NSUnbufferedIO=YES makes Foundation write print() output immediately, as
   # it does in Xcode. Without it, output to a file comes in large blocks.
   case $RUN_KIND in
     mac)
-      executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' $app/Contents/Info.plist)
       # Quit a running copy first, like Xcode does, so the new build is the one that runs.
       if pkill -x $executable 2>/dev/null; then
         while pgrep -x $executable >/dev/null; do sleep $RUN_POLL_INTERVAL; done
@@ -858,7 +881,6 @@ _run_launch() {
       command=(env NSUnbufferedIO=YES $RUN_APP_ENV $app/Contents/MacOS/$executable $RUN_APP_ARGS)
       ;;
     device)
-      bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' $app/Info.plist)
       if [[ $mode != relaunch ]]; then
         print -u2 "Installing on $RUN_NAME"
         xcrun devicectl device install app --device $RUN_ID $app >/dev/null || return 1
@@ -871,7 +893,6 @@ _run_launch() {
         --device $RUN_ID $bundle_id -- $RUN_APP_ARGS)
       ;;
     simulator)
-      bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' $app/Info.plist)
       print -u2 "Starting $RUN_NAME"
       xcrun simctl bootstatus $RUN_ID -b >/dev/null || return 1
       _run_show_simulators
@@ -896,14 +917,253 @@ _run_launch() {
   rm -f $input && mkfifo $input || return 1
   # monitor gives the app a process group of its own, so _run_stop can signal
   # all of it. &! keeps zsh from printing a job number.
+  zmodload -F zsh/datetime p:EPOCHSECONDS
   () {
     setopt local_options monitor
     (
+      # zsh runs the trap when the launch command ends. So after _run_stop,
+      # this shell ends there, and the lines after the command run only for an
+      # app that ends on its own.
+      trap exit TERM
+      local -i started=$EPOCHSECONDS code
       $command <> $input >> $log 2>&1
-      print -r -- "── $RUN_APP_NAME ended with exit status $? ──" >> $log
+      code=$?
+      print -r -- "── $RUN_APP_NAME ended${${code:#0}:+ with exit status $code} ──" >> $log
+      # The crash report search gets a process group of its own, so that
+      # Ctrl-R and the end of the session do not stop it.
+      () {
+        setopt local_options monitor
+        _run_crash_report $app $executable $bundle_id $started $code &!
+      } >> $log 2>&1
     ) </dev/null &!
   }
   REPLY=$!
+}
+
+# _run_crash_report <app> <executable> <bundle-id> <launch-time> <exit-status>
+# Runs when the app ends on its own. Finds the crash report that the
+# destination wrote for the app after the launch time, in epoch seconds, and
+# prints a summary of it. On the Mac, only a signal leaves a crash report, so
+# it looks only then. simctl ends with status 0 after a crash, and devicectl
+# reports signal 9 for any crash, so for a simulator or a device it always
+# looks.
+_run_crash_report() {
+  local app=$1 executable=$2 bundle_id=$3 since=$4 code=$5
+  [[ $RUN_KIND == mac ]] && (( code <= 128 )) && return 0
+  print -r -- "Looking for a crash report of $RUN_APP_NAME on $RUN_NAME…"
+  if _run_find_crash $executable $bundle_id $since; then
+    _run_crash_summary $REPLY $app $executable
+  else
+    print -r -- "$RUN_NAME has no crash report of $RUN_APP_NAME"
+  fi
+}
+
+# _run_find_crash <executable> <bundle-id> <since>
+# Waits up to RUN_CRASH_WAIT seconds for a report of the app that is newer than
+# since, in epoch seconds, and sets REPLY to its path on this Mac. The report
+# is a crash report, or on a device also a memory report that shows that iOS
+# ended the app. The reports of this Mac and of simulators are in
+# RUN_MAC_REPORTS. A report from a device goes to RUN_DEVICE_REPORTS_NAME in
+# the build folder. Fails if no report comes in time.
+_run_find_crash() {
+  local executable=$1 bundle_id=$2 since=$3 folder=$RUN_DERIVED/$RUN_DEVICE_REPORTS_NAME
+  local listing file name
+  local -a names checked
+  zmodload -F zsh/datetime p:EPOCHSECONDS
+  local -i deadline=$(( EPOCHSECONDS + RUN_CRASH_WAIT ))
+  if [[ $RUN_KIND == device ]]; then
+    listing=$(mktemp -t xcode-run-crashes) && mkdir -p $folder || return 1
+  fi
+  {
+    while (( EPOCHSECONDS < deadline )); do
+      if [[ $RUN_KIND == device ]]; then
+        # The reports since the launch that can be about the app: its crash
+        # reports, then memory reports, newest first. After a few minutes, iOS
+        # moves a report to Retired. A copy takes seconds, so each report is
+        # copied once.
+        xcrun devicectl device info files --device $RUN_ID --domain-type systemCrashLogs \
+          --quiet --json-output $listing >/dev/null 2>&1
+        names=(${(f)"$(jq -r --arg prefix $executable- --argjson since $(( since - RUN_CLOCK_SLACK )) '
+          [.result.files[]?
+            | (.relativePath | ltrimstr("Retired/")) as $name
+            | select($name | endswith(".ips") and (contains("/") | not))
+            | select($name | startswith($prefix) or startswith("JetsamEvent-"))
+            | {path: .relativePath, memory: ($name | startswith("JetsamEvent-")),
+               time: (.metadata.lastModDate | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601)}
+            | select(.time >= $since)]
+          | sort_by(.memory, -.time)
+          | .[].path' $listing 2>/dev/null)"})
+        for name in ${names:|checked}; do
+          checked+=($name)
+          file=$folder/${name:t}
+          if xcrun devicectl device copy from --device $RUN_ID --domain-type systemCrashLogs \
+              --source $name --destination $file --quiet >/dev/null 2>&1 &&
+              _run_crash_matches $file $executable $bundle_id $since; then
+            REPLY=$file
+            return 0
+          fi
+          rm -f $file
+        done
+      else
+        # Newest first. ms- picks the files that changed in the last seconds.
+        for file in $RUN_MAC_REPORTS/$executable-*.ips(N.om.ms-$(( EPOCHSECONDS - since + 1 ))); do
+          if _run_crash_matches $file $executable $bundle_id $since; then
+            REPLY=$file
+            return 0
+          fi
+        done
+      fi
+      sleep $RUN_CRASH_POLL
+    done
+    return 1
+  } always {
+    [[ -n $listing ]] && rm -f $listing
+  }
+}
+
+# _run_crash_matches <report> <executable> <bundle-id> <since>
+# Succeeds if the report is complete and is about the app: a crash report of
+# the app that started after since, in epoch seconds, or a memory report that
+# shows that iOS ended the app. So a report of the copy that Ctrl-R stopped
+# does not count. The first line of a report describes it, and the rest is its
+# JSON. A crash report gives the start time of the app as local time, such as
+# "2026-10-14 16:09:42.8078 -0700". A process name in a memory report has at
+# most 32 characters.
+_run_crash_matches() {
+  jq -e -s --arg exe $2 --arg id $3 --argjson since $(( $4 - RUN_CLOCK_SLACK )) '
+    def epoch:
+      capture("^(?<time>[0-9-]+ [0-9:]+)[.0-9]* (?<sign>[+-])(?<h>[0-9]{2})(?<m>[0-9]{2})$")
+      | (.time + "Z" | strptime("%Y-%m-%d %H:%M:%SZ") | mktime)
+        - (if .sign == "-" then -1 else 1 end) * ((.h | tonumber) * 3600 + (.m | tonumber) * 60);
+    .[0] as $about | .[1] as $report
+    | ($about.bug_type == "309" and $about.bundleID == $id
+       and (($report.procLaunch | epoch?) // $since) >= $since)
+      or ($about.bug_type == "298"
+          and any($report.processes[]?; .reason != null and .name == ($exe | .[0:32])))' \
+    $1 >/dev/null 2>&1
+}
+
+# _run_crash_summary <report> <app> <executable>
+# Prints a summary of a report that _run_find_crash found. For a crash: how
+# the app ended, then the stack of the thread that crashed, or the backtrace of
+# the uncaught exception. The stack ends after its last frame in the app, with
+# at most RUN_CRASH_FRAMES frames. A device report has no source lines, so atos
+# looks them up in the app on this Mac, if it is the build that ran.
+_run_crash_summary() {
+  local report=$1 app=$2 executable=$3
+  local row kind label="Crash report" key binary location symbol text
+  local -a rows fields frames hex lines
+  local -A offsets uuids arches found_lines found_symbols
+  local -i more width i
+  # jq prints tab-separated rows: text lines, then frames, then the number of
+  # frames that the summary leaves out, then the label of the report. A frame
+  # row has the index, image name, path of the image in the app (empty for a
+  # system image), architecture, UUID, the offset to look up, symbol, offset in
+  # the symbol, source line, and offset in the image. The offset to look up is
+  # one byte back for a return address, so it is in the calling line.
+  rows=("${(@f)$(jq -r -s --arg name $RUN_APP_NAME --arg app ${app:t} --arg exe $executable \
+      --argjson most $RUN_CRASH_FRAMES '
+    def size: if . >= 1073741824 then "\(. / 1073741824 * 10 | round / 10) GB"
+              else "\(. / 1048576 | round) MB" end;
+    .[0] as $about | .[1] as $report
+    | if $about.bug_type == "298" then
+        ($report.memoryStatus.pageSize // 16384) as $page
+        | first($report.processes[]? | select(.reason != null and .name == ($exe | .[0:32]))) as $process
+        | "text\t── iOS ended \($name) for its memory use: \($process.rpages * $page | size) (\($process.reason)) ──",
+          "text\tiOS ends an app like this when the app uses more memory than iOS allows it, or when the device runs low on memory. It leaves no stack.",
+          "report\tMemory report"
+      else
+        ("/" + $app + "/") as $inside
+        | ($report.exception // {}) as $exception
+        | ($report.faultingThread // 0) as $index
+        | ($report.threads[$index] // {}) as $thread
+        | (if ($report.lastExceptionBacktrace // [] | length) > 0 then
+             {title: "Last exception backtrace", frames: $report.lastExceptionBacktrace}
+           else
+             {title: (["Thread \($index) crashed", $thread.name, $thread.queue]
+                      | map(select(. != null and . != "")) | join(" · ")),
+              frames: ($thread.frames // [])}
+           end) as $stack
+        | [$stack.frames | to_entries[]
+            | .value + {n: .key, image: ($report.usedImages[.value.imageIndex] // {})}] as $frames
+        | ([$frames[] | select(.image.path // "" | contains($inside)) | .n] | last) as $last
+        | ([($last // $most) + 1, $most, ($frames | length)] | min) as $count
+        | "text\t── \($name) crashed\(if $exception.type then ": \($exception.type)" else "" end)\(
+            if $exception.signal then " (\($exception.signal))" else "" end)\(
+            if $exception.subtype then " · \($exception.subtype)" else "" end) ──",
+          ($report.asi // {} | .[] | if type == "array" then .[] else tostring end | "text\t\(.)"),
+          ($report.termination.reasons // [] | .[] | "text\t\(.)"),
+          (select($frames | length > 0) | "text\t\($stack.title)"),
+          ($frames[0:$count][] | [
+            "frame", .n, (.image.name // "???"),
+            (.image.path // "" | if contains($inside) then .[(index($inside) + ($inside | length)):] else "" end),
+            (.image.arch // "arm64"), (.image.uuid // ""),
+            (.imageOffset - (if .n > 0 then 1 else 0 end)),
+            (.symbol // ""), (.symbolLocation // ""),
+            (if (.sourceLine // 0) > 0 then "\(.sourceFile | split("/") | last):\(.sourceLine)" else "" end),
+            .imageOffset
+          ] | map(tostring) | join("\t")),
+          "more\t\(($frames | length) - $count)",
+          "report\tCrash report"
+      end' $report 2>/dev/null)}")
+
+  for row in $rows; do
+    kind=${row%%$'\t'*}
+    case $kind in
+      text) print -r -- ${row#*$'\t'} ;;
+      frame) frames+=($row) ;;
+      more) more=${row#*$'\t'} ;;
+      report) label=${row#*$'\t'} ;;
+    esac
+  done
+
+  # The frames in the app that have no source line, by binary.
+  for row in $frames; do
+    fields=("${(@ps:\t:)row}")
+    (( ${#fields[3]} > width )) && width=${#fields[3]}
+    [[ -n $fields[4] && -z $fields[10] ]] || continue
+    offsets[$fields[4]]+=" $fields[7]"
+    uuids[$fields[4]]=$fields[6]
+    arches[$fields[4]]=$fields[5]
+  done
+  # One atos call for each binary. atos prints a line such as
+  # "f() (in Maier) (File.swift:12)" for each offset, in the same order.
+  for binary in ${(k)offsets}; do
+    [[ $(xcrun dwarfdump --uuid --arch=$arches[$binary] $app/$binary 2>/dev/null) == \
+      "UUID: ${(U)uuids[$binary]} "* ]] || continue
+    hex=()
+    for i in ${=offsets[$binary]}; do
+      hex+=(0x$(( [##16] i )))
+    done
+    lines=("${(@f)$(xcrun atos -o $app/$binary -arch $arches[$binary] -offset $hex 2>/dev/null)}")
+    for (( i = 1; i <= $#hex; i++ )); do
+      [[ $lines[i] == *' (in '* ]] || continue
+      key="$binary $(( hex[i] ))"
+      found_symbols[$key]=${lines[i]%% \(in *}
+      # Code that the compiler generates has line 0.
+      if [[ $lines[i] == *') ('*:<1->')' ]]; then
+        location=${${lines[i]##* \(}%\)}
+        found_lines[$key]=${location:t}
+      fi
+    done
+  done
+
+  for row in $frames; do
+    fields=("${(@ps:\t:)row}")
+    key="$fields[4] $fields[7]"
+    symbol=${fields[8]:-$found_symbols[$key]}
+    location=${fields[10]:-$found_lines[$key]}
+    if [[ -z $symbol ]]; then
+      text="$fields[3] + $fields[11]"
+    elif [[ -n $location ]]; then
+      text="$symbol ($location)"
+    else
+      text="$symbol${fields[9]:+ + $fields[9]}"
+    fi
+    print -r -- "${(l:3:)fields[2]}  ${(r:width:)fields[3]}  $text"
+  done
+  (( more )) && print -r -- "     $more more frame${${more:#1}:+s} in the crash report"
+  print -r -- "$label: ${report/#$HOME/~}"
 }
 
 # _run_stop <group-id>
