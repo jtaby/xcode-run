@@ -1,0 +1,37 @@
+{
+  "name": "xcode-run",
+  "version": "0.1.0",
+  "description": "Build an iOS app from the current git worktree and run it on your Mac, an iPhone, an iPad, or a simulator, with a console you can filter. No Xcode window needed.",
+  "keywords": [
+    "xcode",
+    "xcodebuild",
+    "ios",
+    "simulator",
+    "simctl",
+    "devicectl",
+    "mac-catalyst",
+    "git-worktree",
+    "fzf",
+    "cli"
+  ],
+  "license": "MIT",
+  "author": "Majd Taby",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jtaby/xcode-run.git"
+  },
+  "homepage": "https://github.com/jtaby/xcode-run#readme",
+  "bugs": {
+    "url": "https://github.com/jtaby/xcode-run/issues"
+  },
+  "bin": {
+    "run": "bin/run",
+    "xcode-run": "bin/run"
+  },
+  "files": [
+    "bin/run"
+  ],
+  "os": [
+    "darwin"
+  ]
+}
