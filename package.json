@@ -1,6 +1,6 @@
 {
   "name": "xcode-run",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Build an iOS app from the current git worktree and run it on your Mac, an iPhone, an iPad, or a simulator, with a console you can filter. No Xcode window needed.",
   "keywords": [
     "xcode",
