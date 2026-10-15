@@ -756,14 +756,18 @@ _run_words() {
 # Sets reply to the rows of _run_destinations that the query matches. Each word
 # of the query must start a word of the row's name, type, or details, which are
 # what the list shows. Then:
+# - If some of the rows are this Mac or devices, the simulators don't count, so
+#   "iphone 17" matches a connected iPhone 17 Pro. "iphone 17 sim" matches the
+#   simulators, because their type is Simulator.
 # - If the query has all of the words of the name or model of some rows, only
-#   those rows count, so "iphone 17" matches iPhone 17 but not iPhone 17 Pro.
+#   those rows count, so "iphone 17 sim" matches iPhone 17 but not iPhone 17
+#   Pro.
 # - If the rows that count are all simulators with the same name, only the
 #   first one counts: a booted one, or else the one with the newest iOS.
-#   "iphone 17 26.5" picks another one.
+#   "iphone 17 sim 26.5" picks another one.
 _run_match() {
   local row word name
-  local -a query fields words matches whole keys
+  local -a query fields words matches devices whole keys
   _run_words $1
   query=($reply)
   shift
@@ -775,6 +779,12 @@ _run_match() {
       (( ${words[(I)$word*]} )) || continue 2
     done
     matches+=($row)
+  done
+  devices=(${matches:#simulator$'\t'*})
+  (( $#devices )) && matches=($devices)
+
+  for row in $matches; do
+    fields=("${(@ps:\t:)row}")
     for name in $fields[3] $fields[6]; do
       _run_words $name
       if (( $#reply && ! ${#${(@)reply:|query}} )); then
