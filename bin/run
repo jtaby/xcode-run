@@ -5,6 +5,10 @@
 #   run            Pick where to run the app: this Mac (with Mac Catalyst), a
 #                  connected iPhone or iPad, or an iOS simulator. Then build the
 #                  app, run it there, and show its console.
+#   run <destination>
+#                  Build and run on the destination that the words match, such
+#                  as mac or iphone 17, without the list. _run_match has the
+#                  rules. If several destinations match, the list shows them.
 #   run --no-build Run the last build of the worktree again, on the same
 #                  destination, and show its console.
 #   run setup      Answer the setup questions for the repository again.
@@ -696,13 +700,14 @@ _run_build() {
 
 # _run_destinations
 # Prints one tab-separated line per place that can run the app: kind (mac,
-# device, or simulator), ID, name, type, and details. This Mac comes first if
-# the app runs on it with Mac Catalyst. Then come reachable iPhones, then
-# reachable iPads (USB before network), then iOS simulators: booted ones
+# device, or simulator), ID, name, type, details, and model, such as iPhone 17
+# Pro. A simulator has no model, because its name is the model. This Mac comes
+# first if the app runs on it with Mac Catalyst. Then come reachable iPhones,
+# then reachable iPads (USB before network), then iOS simulators: booted ones
 # first, then the newest iOS versions.
 _run_destinations() {
   if [[ $RUN_MAC_CATALYST == yes ]]; then
-    print -r -- "mac"$'\t'"mac"$'\t'"My Mac"$'\t'"Mac"$'\t'"Mac Catalyst · macOS $(sw_vers -productVersion)"
+    print -r -- "mac"$'\t'"mac"$'\t'"My Mac"$'\t'"Mac"$'\t'"Mac Catalyst · macOS $(sw_vers -productVersion)"$'\t'"Mac"
   fi
 
   local json=$(mktemp -t xcode-run-devices)
@@ -719,7 +724,8 @@ _run_destinations() {
     | (if .hardwareProperties.deviceType == "iPad" then "iPadOS" else "iOS" end) as $os
     | (if .connectionProperties.transportType == "wired" then "USB" else "Network" end) as $link
     | ["device", .identifier, .deviceProperties.name, .hardwareProperties.deviceType,
-       "\(.hardwareProperties.marketingName) · \($os) \(.deviceProperties.osVersionNumber) · \($link)"]
+       "\(.hardwareProperties.marketingName) · \($os) \(.deviceProperties.osVersionNumber) · \($link)",
+       .hardwareProperties.marketingName // ""]
     | join("\t")' $json 2>/dev/null
   rm -f $json
 
@@ -733,36 +739,108 @@ _run_destinations() {
     | sort_by((.booted | not), (.version | map(-.)), .ipad, .name)
     | .[]
     | ["simulator", .udid, .name, "Simulator",
-       "iOS \(.version | map(tostring) | join("."))\(if .booted then " · Booted" else "" end)"]
+       "iOS \(.version | map(tostring) | join("."))\(if .booted then " · Booted" else "" end)",
+       ""]
     | join("\t")'
 }
 
-# _run_pick
-# Lists the destinations in fzf and sets RUN_KIND, RUN_ID, and RUN_NAME to the
-# one that the user picks. The list starts on the last destination.
+# _run_words <text>
+# Sets reply to the words of the text, in lowercase. Each character that is not
+# a letter or a digit separates words, so "iPad (9th generation)" gives ipad,
+# 9th, and generation.
+_run_words() {
+  reply=(${=${(L)1//[^[:alnum:]]/ }})
+}
+
+# _run_match <query> [<row>...]
+# Sets reply to the rows of _run_destinations that the query matches. Each word
+# of the query must start a word of the row's name, type, or details, which are
+# what the list shows. Then:
+# - If the query has all of the words of the name or model of some rows, only
+#   those rows count, so "iphone 17" matches iPhone 17 but not iPhone 17 Pro.
+# - If the rows that count are all simulators with the same name, only the
+#   first one counts: a booted one, or else the one with the newest iOS.
+#   "iphone 17 26.5" picks another one.
+_run_match() {
+  local row word name
+  local -a query fields words matches whole keys
+  _run_words $1
+  query=($reply)
+  shift
+  for row in "$@"; do
+    fields=("${(@ps:\t:)row}")
+    _run_words "$fields[3,5]"
+    words=($reply)
+    for word in $query; do
+      (( ${words[(I)$word*]} )) || continue 2
+    done
+    matches+=($row)
+    for name in $fields[3] $fields[6]; do
+      _run_words $name
+      if (( $#reply && ! ${#${(@)reply:|query}} )); then
+        whole+=($row)
+        break
+      fi
+    done
+  done
+  (( $#whole )) && matches=($whole)
+
+  for row in $matches; do
+    fields=("${(@ps:\t:)row}")
+    keys+=("$fields[1] $fields[3]")
+  done
+  if (( ${#${(@u)keys}} == 1 )) && [[ $keys[1] == 'simulator '* ]]; then
+    matches=($matches[1])
+  fi
+  reply=($matches)
+}
+
+# _run_pick [<query>]
+# Sets RUN_KIND, RUN_ID, and RUN_NAME to the destination that the user picks
+# from a list in fzf, which starts on the last destination. With a query, such
+# as "iphone 17", it takes the destination that _run_match finds, without the
+# list. If several destinations match, the list shows only them, and if none
+# does, it shows all.
 _run_pick() {
   local -a rows=("${(@f)$(_run_destinations)}") fields lines
   local row last choice
   local -i type_width name_width selected=1 i
-  for row in $rows; do
-    fields=("${(@ps:\t:)row}")
-    (( ${#fields[4]} > type_width )) && type_width=${#fields[4]}
-    (( ${#fields[3]} > name_width )) && name_width=${#fields[3]}
-  done
-  [[ -r $RUN_LAST_DESTINATION ]] && last=$(<$RUN_LAST_DESTINATION)
-  for (( i = 1; i <= $#rows; i++ )); do
-    fields=("${(@ps:\t:)rows[i]}")
-    [[ $fields[2] == "$last" ]] && selected=i
-    # fzf shows only the 4th field: the type, name, and details in columns.
-    lines+=("${(pj:\t:)fields[1,3]}"$'\t\e[2m'"${(r:type_width:)fields[4]}"$'\e[0m  '"${(r:name_width:)fields[3]}"$'  \e[2m'"$fields[5]"$'\e[0m')
-  done
+  if [[ -n $1 ]]; then
+    _run_match $1 $rows
+    if (( $#reply == 1 )); then
+      choice=$reply[1]
+    elif (( $#reply )); then
+      print -u2 -r -- "$#reply destinations match \"$1\""
+      rows=($reply)
+    else
+      print -u2 -r -- "No destination matches \"$1\""
+    fi
+  fi
 
-  choice=$(print -rl -- $lines | fzf --ansi --no-sort --exact --layout=reverse \
-    --height=$RUN_PICKER_HEIGHT --delimiter='\t' --with-nth=4 \
-    --prompt="Run $RUN_APP_NAME on: " --header='enter: build and run · esc: cancel' \
-    --bind="load:pos($selected)") || return 1
+  if [[ -z $choice ]]; then
+    for row in $rows; do
+      fields=("${(@ps:\t:)row}")
+      (( ${#fields[4]} > type_width )) && type_width=${#fields[4]}
+      (( ${#fields[3]} > name_width )) && name_width=${#fields[3]}
+    done
+    [[ -r $RUN_LAST_DESTINATION ]] && last=$(<$RUN_LAST_DESTINATION)
+    for (( i = 1; i <= $#rows; i++ )); do
+      fields=("${(@ps:\t:)rows[i]}")
+      [[ $fields[2] == "$last" ]] && selected=i
+      # fzf shows only the 2nd field: the type, name, and details in columns.
+      # The 1st is the number of the row.
+      lines+=("$i"$'\t\e[2m'"${(r:type_width:)fields[4]}"$'\e[0m  '"${(r:name_width:)fields[3]}"$'  \e[2m'"$fields[5]"$'\e[0m')
+    done
+
+    choice=$(print -rl -- $lines | fzf --ansi --no-sort --exact --layout=reverse \
+      --height=$RUN_PICKER_HEIGHT --delimiter='\t' --with-nth=2 \
+      --prompt="Run $RUN_APP_NAME on: " --header='enter: build and run · esc: cancel' \
+      --bind="load:pos($selected)") || return 1
+    choice=$rows[${choice%%$'\t'*}]
+  fi
   fields=("${(@ps:\t:)choice}")
   RUN_KIND=$fields[1] RUN_ID=$fields[2] RUN_NAME=$fields[3]
+  print -u2 -r -- "Run $RUN_APP_NAME on: $fields[4]  $fields[3]  $fields[5]"
   mkdir -p ${RUN_LAST_DESTINATION:h} && print -r -- $RUN_ID > $RUN_LAST_DESTINATION
 }
 
@@ -1351,6 +1429,7 @@ _run_check_tools() {
 _run_usage() {
   local -a commands=(
     '' 'Pick a destination, then build, run, and show the console.'
+    '<destination>' 'Run on the destination that matches, such as mac or iphone 17.'
     --no-build 'Run the last build again on the same destination.'
     setup 'Answer the setup questions for this repository again.'
     --help 'Show this help.'
@@ -1360,7 +1439,7 @@ _run_usage() {
   print -r -- "Build and run an iOS app from the current git worktree."
   print
   for name text in "${commands[@]}"; do
-    print -r -- "  ${(r:21:)${:-$RUN_COMMAND${name:+ $name}}}$text"
+    print -r -- "  ${(r:25:)${:-$RUN_COMMAND${name:+ $name}}}$text"
   done
   print
   print -r -- "The first run in a repository asks the setup questions."
@@ -1388,10 +1467,10 @@ run_setup() {
   }
 }
 
-# run [--no-build]
-# Builds the app for a destination that the user picks, or with --no-build
-# takes the last build and its destination. Then launches the app there and
-# shows its console.
+# run [--no-build | <destination>]
+# Builds the app for a destination that the user picks, or that the words of
+# <destination> match. With --no-build, it takes the last build and its
+# destination. Then launches the app there and shows its console.
 run() {
   if [[ ! -t 0 || ! -t 1 ]]; then
     print -u2 "$RUN_COMMAND needs a terminal"
@@ -1404,7 +1483,7 @@ run() {
     _run_last_run || return 1
   else
     # Esc in the list cancels without an error.
-    _run_pick || return 0
+    _run_pick $1 || return 0
     case $RUN_KIND in
       mac) _run_build maccatalyst 'platform=macOS,variant=Mac Catalyst' 'Mac Catalyst' ;;
       device) _run_build iphoneos 'generic/platform=iOS' iOS ;;
@@ -1460,9 +1539,10 @@ if [[ $ZSH_EVAL_CONTEXT == toplevel ]]; then
     _export) shift; _run_export "$@" ;;
     _relaunch) _run_relaunch ;;
     _help) _run_help ;;
-    *)
+    -*)
       _run_usage >&2
       exit 2
       ;;
+    *) run "$*" ;;
   esac
 fi

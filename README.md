@@ -41,6 +41,7 @@ In a git repository with an iOS app:
 
 ```sh
 run             # pick a destination, then build, run, and show the console
+run iphone 17   # build and run on the destination that matches, without the list
 run --no-build  # run the last build again on the same destination
 run setup       # answer the setup questions again
 run --help
@@ -69,6 +70,34 @@ The list shows My Mac (if the app supports Mac Catalyst), then connected
 iPhones, then connected iPads (USB before network), then iOS simulators (booted
 ones first, then the newest iOS versions). The list starts on the destination
 that you picked last time.
+
+### Name the destination
+
+To skip the list, name the destination after `run`:
+
+```sh
+run mac           # My Mac
+run iphone 17     # the iPhone 17 simulator, not iPhone 17 Pro
+run iphone 17 26  # the iPhone 17 simulator with iOS 26
+run ipad 9th gen  # an iPad (9th generation)
+run ada           # Ada's iPhone
+```
+
+Each word must match the start of a word that the list shows for the
+destination, in any case. Then:
+
+- If the words include all of the words of a destination's name, or of the
+  model of an iPhone or iPad, only such destinations count. That's why
+  `run iphone 17` doesn't count iPhone 17 Pro.
+- If the destinations that count are all simulators with the same name, `run`
+  takes the booted one, or else the one with the newest iOS. Add the iOS
+  version to pick another one.
+- If one destination counts, `run` builds and runs the app there.
+- If more than one counts, `run` says how many and lists only them. If none
+  does, it lists all of the destinations.
+
+The destination that you name counts as your pick, so the list starts on it
+next time.
 
 ### Build
 
