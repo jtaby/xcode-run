@@ -122,6 +122,7 @@ app's output, newest line at the bottom.
 | Down, PgDn, End | Scroll forward. On the newest line, the view follows new lines again. |
 | Ctrl-Y | Copy the lines that match the filter (or the full log) to the clipboard. |
 | Ctrl-S | Save the same lines to a file on your Desktop. |
+| Ctrl-B | Build the app again while it runs, then stop it and launch the new build. |
 | Ctrl-R | Stop the app and launch the same build again, without building or installing it. |
 | Ctrl-C | Stop the app and end the session. |
 | ? | Show all of the keys. |
@@ -152,6 +153,19 @@ Console to see all of its threads.
 
 If iOS ends the app on a device because of its memory use, the console shows
 that and how much memory the app used. That leaves no stack.
+
+### Build and run again
+
+To build the app again without leaving the session, press Ctrl-B in the
+console. The build shows in the same live view as the first one, and the app
+keeps running while it builds. When the build is done, `run` stops the app,
+installs the new build, and launches it. The console comes back with the new
+output under a `── Built … ──` line, and the filter stays.
+
+If the build fails, the app keeps running, and the console shows the errors at
+the end of the log. Fix them and press Ctrl-B again. Ctrl-C in the build stops
+it and goes back to the console. If the new build can't launch, the session
+ends and shows why.
 
 ### Run again without building
 

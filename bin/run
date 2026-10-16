@@ -33,8 +33,10 @@
 # The app gets the launch arguments and environment variables that its scheme
 # enables in Xcode. The console shows all of its output, newest at the bottom,
 # and keeps it in last-console.log in the build folder. Type to filter it.
-# Ctrl-R stops the app and launches the same build again, in the same console.
-# Press ? in the console for all of its keys, which _run_help lists.
+# Ctrl-B builds the app again while it runs, then stops it and launches the new
+# build. Ctrl-R stops the app and launches the same build again, without
+# building it. Both go on in the same console, with the same filter. Press ?
+# in the console for all of its keys, which _run_help lists.
 #
 # If the app crashes, the console shows a summary of the crash report that the
 # destination writes: how the app ended, and the stack of the thread that
@@ -620,7 +622,8 @@ _run_configure() {
 
 # _run_build <sdk-suffix> <destination> <platform-name>
 # Sets REPLY to the path of the built app on success. The SDK suffix is the
-# end of the products folder name, such as iphoneos. It runs in the current
+# end of the products folder name, such as iphoneos. Prints a summary of the
+# build and sets reply to its lines, without colors. It runs in the current
 # shell, not in $(...), so its Ctrl-C handling can stop the build and clean up
 # before the script exits.
 _run_build() {
@@ -670,32 +673,51 @@ _run_build() {
   _run_tally ${#${(M)output:#${~RUN_STEP_PATTERN}}} ${#${(M)output:#${~RUN_WARNING_PATTERN}}} $#errors
   local tally=$REPLY
 
+  local -a summary
   if (( build_status == RUN_STOPPED_STATUS )); then
-    print -u2 "Build stopped after $elapsed"
-    return $build_status
-  fi
-  if (( build_status != 0 )); then
-    print -u2 "Build failed after $elapsed · $tally"
-    local error
+    summary=("Build stopped after $elapsed")
+  elif (( build_status != 0 )); then
+    summary=("Build failed after $elapsed · $tally")
     if (( $#errors )); then
-      for error in "${(@)errors[1,RUN_FAILURE_LINES]}"; do
-        if [[ -t 2 ]]; then
-          _run_paint "$error"
-          error=$REPLY
-        fi
-        print -u2 -r -- $error
-      done
-      (( $#errors > RUN_FAILURE_LINES )) && print -u2 "…and $(( $#errors - RUN_FAILURE_LINES )) more"
+      summary+=("${(@)errors[1,RUN_FAILURE_LINES]}")
+      (( $#errors > RUN_FAILURE_LINES )) && summary+=("…and $(( $#errors - RUN_FAILURE_LINES )) more")
     else
-      tail -n $RUN_FAILURE_LINES $log >&2
+      summary+=(${(f)"$(tail -n $RUN_FAILURE_LINES $log)"})
     fi
-    print -u2 "All output: less ${progress#$PWD/}"
-    print -u2 "xcodebuild log: ${log#$PWD/}"
-    return $build_status
+    summary+=("All output: less ${progress#$PWD/}" "xcodebuild log: ${log#$PWD/}")
+  else
+    summary=("Built ${root:t} for $platform in $elapsed · $tally" "All output: less ${progress#$PWD/}")
   fi
-  print -u2 "Built ${root:t} for $platform in $elapsed · $tally"
-  print -u2 "All output: less ${progress#$PWD/}"
+  local line
+  for line in "${summary[@]}"; do
+    if [[ -t 2 ]]; then
+      _run_paint "$line"
+      line=$REPLY
+    fi
+    print -u2 -r -- $line
+  done
+  reply=("${summary[@]}")
+  (( build_status )) && return $build_status
   REPLY=$derived/Build/Products/$products_dir/$RUN_APP_NAME.app
+}
+
+# _run_build_app
+# Builds the app for the destination in RUN_KIND and RUN_ID. Sets RUN_APP to
+# the built app, and records both in RUN_LAST_RUN_NAME for run --no-build.
+# Sets reply to the summary lines of the build, which the terminal shows.
+_run_build_app() {
+  case $RUN_KIND in
+    mac) _run_build maccatalyst 'platform=macOS,variant=Mac Catalyst' 'Mac Catalyst' ;;
+    device) _run_build iphoneos 'generic/platform=iOS' iOS ;;
+    simulator)
+      # Boot the simulator while the app builds.
+      xcrun simctl boot $RUN_ID >/dev/null 2>&1 &!
+      _run_build iphonesimulator 'generic/platform=iOS Simulator' 'iOS Simulator'
+      ;;
+  esac || return
+  RUN_APP=$REPLY
+  local -a record=($RUN_KIND $RUN_ID $RUN_NAME ${RUN_APP#$RUN_DERIVED/})
+  print -r -- ${(pj:\t:)record} > $RUN_DERIVED/$RUN_LAST_RUN_NAME
 }
 
 # _run_destinations
@@ -941,10 +963,10 @@ _run_wait_for_unlock() {
 
 # _run_launch <app> <log> [relaunch]
 # Installs the app on the destination if necessary. Then starts it in the
-# background, in a process group of its own, and writes all of its output to
+# background, in a process group of its own, and adds all of its output to
 # the log. Sets REPLY to the process group ID. The group ends when the app ends.
 # With relaunch, it starts the copy that the destination has already: it does
-# not install the app or wait for a locked device, and it adds to the log.
+# not install the app or wait for a locked device.
 # If the app ends on its own, _run_crash_report adds its crash to the log.
 _run_launch() {
   local app=$1 log=$2 mode=$3 plist=$1/Info.plist bundle_id executable
@@ -996,7 +1018,6 @@ _run_launch() {
   esac
 
   print -u2 "Launching $RUN_APP_NAME on $RUN_NAME"
-  [[ $mode == relaunch ]] || : > $log
   # simctl --console stops following the app at the end of its input, so the
   # input must stay open. The terminal is not a possible input, because the
   # console reads the keys from it. The launch command opens this pipe for both
@@ -1268,11 +1289,13 @@ _run_stop() {
   return 0
 }
 
-# _run_console <log> <title>
-# Shows the log in fzf until the user presses Ctrl-C. The notes at the top of
-# this script list the keys.
+# _run_console <log> <title> [<report>] [<filter>]
+# Shows the log in fzf, with the title and the report in the footer, and the
+# filter typed in. The notes at the top of this script list the keys. Succeeds
+# if the user presses Ctrl-B to build the app again, and sets REPLY to the
+# filter then. Fails if the user presses Ctrl-C.
 _run_console() {
-  local log=$1 title=$2
+  local log=$1 title=$2 report=$3 filter=$4
   local again="zsh -f ${(q)RUN_SCRIPT}"
   # Scrolling back turns on tracking, so the line in focus stays in place when
   # new lines come in. Going back to the newest line turns tracking off, so the
@@ -1282,7 +1305,7 @@ _run_console() {
   local resume='transform:(( FZF_POS == 1 )) && [[ $FZF_PROMPT == *paused* ]] && print "toggle-track+change-prompt:Filter: "'
   # ? shows the help when the filter is empty. In a filter, it is a character.
   local help="transform:[[ -n \$FZF_QUERY ]] && print 'put(?)' || print 'execute($again _help)'"
-  local keys='?: help · ctrl-r: relaunch · ctrl-y: copy · ctrl-s: save · end: newest line · ctrl-c: stop app'
+  local keys='?: help · ctrl-b: rebuild · ctrl-r: relaunch · ctrl-y: copy · ctrl-s: save · end: newest line · ctrl-c: stop app'
   # The keys that run this script again get the session from these variables.
   local -a session=(
     RUN_LOG=$log RUN_TITLE=$title RUN_SESSION=$RUN_SESSION
@@ -1290,12 +1313,16 @@ _run_console() {
     RUN_KIND=$RUN_KIND RUN_ID=$RUN_ID RUN_NAME=$RUN_NAME
     RUN_ROOT=$RUN_ROOT RUN_PROJECT=$RUN_PROJECT RUN_SCHEME=$RUN_SCHEME RUN_DERIVED=$RUN_DERIVED
   )
-  env $session FZF_DEFAULT_COMMAND="tail -n +1 -F ${(q)log}" fzf \
+  # --print-query prints the filter. Ctrl-B prints rebuild after it, and ends
+  # fzf like Enter does. Ctrl-C prints nothing.
+  local -a output=("${(@f)$(env $session FZF_DEFAULT_COMMAND="tail -n +1 -F ${(q)log}" fzf \
     --with-shell='zsh -fc' \
     --tac --no-sort --exact --tail=$RUN_CONSOLE_LINES --wrap --no-multi \
     --prompt='Filter: ' --info=inline-right --ghost='words, !hidden, a | b' \
-    --header=$keys --footer=$title \
+    --print-query --query=$filter \
+    --header=$keys --footer="$title${report:+ · $report}" \
     --bind='enter:ignore,esc:clear-query' \
+    --bind='ctrl-b:print(rebuild)+accept' \
     --bind="up:up+$pause" \
     --bind="page-up:page-up+$pause" \
     --bind="scroll-up:up+$pause" \
@@ -1307,8 +1334,52 @@ _run_console() {
     --bind="ctrl-r:+bg-transform-footer:$again _relaunch" \
     --bind="?:$help" \
     --bind="ctrl-y:transform-footer:$again _export copy {*f}" \
-    --bind="ctrl-s:transform-footer:$again _export save {*f}"
-  return 0
+    --bind="ctrl-s:transform-footer:$again _export save {*f}")}")
+  [[ $output[2] == rebuild ]] || return 1
+  REPLY=$output[1]
+}
+
+# _run_wait_relaunch
+# Waits for a relaunch from the console's Ctrl-R to finish, so the group file
+# of the session has the app that runs now. Then lets go of the lock, so
+# Ctrl-R works in the next console.
+_run_wait_relaunch() {
+  local -i lock
+  zmodload -F zsh/system b:zsystem
+  zsystem flock -f lock -t $RUN_STOP_GRACE $RUN_SESSION/lock 2>/dev/null || return 0
+  zsystem flock -u $lock
+}
+
+# _run_rebuild <log> <filter>
+# Runs after Ctrl-B in the console. Builds the app again in the live build
+# view, while the app keeps running. If the build works, stops the app, then
+# installs and launches the new build, and writes its process group to the
+# group file of the session. Its output goes on in the log under the build
+# summary. If the build fails, or Ctrl-C stops it, the app keeps running and
+# the summary goes in the log with the errors. Sets REPLY to a short report
+# for the console footer. Fails if the new build does not launch.
+_run_rebuild() {
+  local log=$1 filter=$2
+  _run_build_app
+  local -i code=$?
+  # The log gets the summary like the terminal, with relative paths.
+  local -a summary=("${(@)reply//$PWD\/}")
+  if (( code )); then
+    print -rl -- "── $summary[1] ──" "${(@)summary[2,-1]}" >> $log
+    if (( code == RUN_STOPPED_STATUS )); then
+      REPLY="Build stopped"
+    elif [[ -n $filter ]]; then
+      REPLY="Build failed. Esc clears the filter to show why."
+    else
+      REPLY="Build failed. The console shows why."
+    fi
+    return 0
+  fi
+  _run_stop $(<$RUN_SESSION/group)
+  print -r -- "── $summary[1] ──" >> $log
+  _run_launch $RUN_APP $log || return 1
+  print -r -- $REPLY > $RUN_SESSION/group
+  REPLY="Built and relaunched $RUN_APP_NAME at $(date +%H:%M:%S)"
 }
 
 # _run_export <copy|save> <matches-file>
@@ -1400,6 +1471,9 @@ _run_help() {
   ${bold}Ctrl-Y${plain}        Copy the lines that match the filter to the clipboard.
                 With no filter, copy the full log.
   ${bold}Ctrl-S${plain}        Save the same lines to a file in ${RUN_SAVE_DIR/#$HOME/~}.
+  ${bold}Ctrl-B${plain}        Build the app again while it runs, then stop it and
+                launch the new build. If the build fails, the app keeps
+                running, and the errors go on below.
   ${bold}Ctrl-R${plain}        Stop the app and launch the same build again, without
                 building or installing it. Its output goes on below.
   ${bold}Ctrl-C${plain}        Stop the app and end the session.
@@ -1480,7 +1554,8 @@ run_setup() {
 # run [--no-build | <destination>]
 # Builds the app for a destination that the user picks, or that the words of
 # <destination> match. With --no-build, it takes the last build and its
-# destination. Then launches the app there and shows its console.
+# destination. Then launches the app there and shows its console. Ctrl-B in
+# the console builds the app again and launches the new build.
 run() {
   if [[ ! -t 0 || ! -t 1 ]]; then
     print -u2 "$RUN_COMMAND needs a terminal"
@@ -1494,21 +1569,11 @@ run() {
   else
     # Esc in the list cancels without an error.
     _run_pick $1 || return 0
-    case $RUN_KIND in
-      mac) _run_build maccatalyst 'platform=macOS,variant=Mac Catalyst' 'Mac Catalyst' ;;
-      device) _run_build iphoneos 'generic/platform=iOS' iOS ;;
-      simulator)
-        # Boot the simulator while the app builds.
-        xcrun simctl boot $RUN_ID >/dev/null 2>&1 &!
-        _run_build iphonesimulator 'generic/platform=iOS Simulator' 'iOS Simulator'
-        ;;
-    esac || return 1
-    RUN_APP=$REPLY
-    local -a record=($RUN_KIND $RUN_ID $RUN_NAME ${RUN_APP#$RUN_DERIVED/})
-    print -r -- ${(pj:\t:)record} > $RUN_DERIVED/$RUN_LAST_RUN_NAME
+    _run_build_app || return 1
   fi
   local log=$RUN_DERIVED/last-console.log
 
+  : > $log
   _run_launch $RUN_APP $log || return 1
   local group=$REPLY
   # Ctrl-R in the console launches the app again, in a new process group. The
@@ -1520,22 +1585,35 @@ run() {
   }
   print -r -- $group > $RUN_SESSION/group
   : > $RUN_SESSION/lock
-  # Closing the terminal also stops the app.
-  trap '_run_stop $(<$RUN_SESSION/group); rm -rf $RUN_SESSION; exit 1' HUP TERM
-  _run_console $log "${RUN_ROOT:t} on $RUN_NAME"
+  # Closing the terminal also stops the app. So does Ctrl-C after a build in
+  # the console, such as while the script waits for a locked device.
+  trap '_run_stop $(<$RUN_SESSION/group); rm -rf $RUN_SESSION; exit 1' INT HUP TERM
 
-  # Wait for a relaunch to finish, so the group is the one that runs now.
-  zmodload -F zsh/system b:zsystem
-  zsystem flock -t $RUN_STOP_GRACE $RUN_SESSION/lock 2>/dev/null
+  # Ctrl-B ends the console, so the build can show in the terminal. Then the
+  # console comes back with the same filter.
+  local title="${RUN_ROOT:t} on $RUN_NAME" report filter
+  local -i launch_failed
+  while _run_console $log $title "$report" "$filter"; do
+    filter=$REPLY
+    _run_wait_relaunch
+    if ! _run_rebuild $log "$filter"; then
+      launch_failed=1
+      break
+    fi
+    report=$REPLY
+  done
+
+  _run_wait_relaunch
   group=$(<$RUN_SESSION/group)
   rm -rf $RUN_SESSION
   if kill -0 -- -$group 2>/dev/null; then
     _run_stop $group
     print -u2 "Stopped $RUN_APP_NAME on $RUN_NAME"
-  else
+  elif (( ! launch_failed )); then
     print -u2 "$RUN_APP_NAME ended on $RUN_NAME"
   fi
   print -u2 "Console log: ${log#$PWD/}"
+  return launch_failed
 }
 
 # Run only when executed, not when sourced, so tests can call the functions.
