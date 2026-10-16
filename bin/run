@@ -12,6 +12,9 @@
 #   run --no-build Run the last build of the worktree again, on the same
 #                  destination, and show its console.
 #   run setup      Answer the setup questions for the repository again.
+#   run completion <fish|zsh>
+#                  Print the Tab completion of run and xcode-run for the shell.
+#                  Then Tab after run offers the words that pick a destination.
 #   run --help     Show the commands. --version shows the version.
 #
 # The script needs macOS, Xcode, fzf RUN_FZF_MIN_VERSION or newer, and jq.
@@ -774,22 +777,13 @@ _run_words() {
   reply=(${=${(L)1//[^[:alnum:]]/ }})
 }
 
-# _run_match <query> [<row>...]
-# Sets reply to the rows of _run_destinations that the query matches. Each word
-# of the query must start a word of the row's name, type, or details, which are
-# what the list shows. Then:
-# - If some of the rows are this Mac or devices, the simulators don't count, so
-#   "iphone 17" matches a connected iPhone 17 Pro. "iphone 17 sim" matches the
-#   simulators, because their type is Simulator.
-# - If the query has all of the words of the name or model of some rows, only
-#   those rows count, so "iphone 17 sim" matches iPhone 17 but not iPhone 17
-#   Pro.
-# - If the rows that count are all simulators with the same name, only the
-#   first one counts: a booted one, or else the one with the newest iOS.
-#   "iphone 17 sim 26.5" picks another one.
-_run_match() {
-  local row word name
-  local -a query fields words matches devices whole keys
+# _run_filter <query> [<row>...]
+# Sets reply to the rows of _run_destinations in which each word of the query
+# starts a word of the row's name, type, or details, which are what the list
+# shows.
+_run_filter() {
+  local row word
+  local -a query fields words matches
   _run_words $1
   query=($reply)
   shift
@@ -802,6 +796,28 @@ _run_match() {
     done
     matches+=($row)
   done
+  reply=($matches)
+}
+
+# _run_match <query> [<row>...]
+# Sets reply to the rows of _run_destinations that the query matches. The rows
+# that _run_filter keeps for the query count. Then:
+# - If some of the rows are this Mac or devices, the simulators don't count, so
+#   "iphone 17" matches a connected iPhone 17 Pro. "iphone 17 sim" matches the
+#   simulators, because their type is Simulator.
+# - If the query has all of the words of the name or model of some rows, only
+#   those rows count, so "iphone 17 sim" matches iPhone 17 but not iPhone 17
+#   Pro.
+# - If the rows that count are all simulators with the same name, only the
+#   first one counts: a booted one, or else the one with the newest iOS.
+#   "iphone 17 sim 26.5" picks another one.
+_run_match() {
+  local row name
+  local -a query fields matches devices whole keys
+  _run_words $1
+  query=($reply)
+  _run_filter "$@"
+  matches=($reply)
   devices=(${matches:#simulator$'\t'*})
   (( $#devices )) && matches=($devices)
 
@@ -874,6 +890,52 @@ _run_pick() {
   RUN_KIND=$fields[1] RUN_ID=$fields[2] RUN_NAME=$fields[3]
   print -u2 -r -- "Run $RUN_APP_NAME on: $fields[4]  $fields[3]  $fields[5]"
   mkdir -p ${RUN_LAST_DESTINATION:h} && print -r -- $RUN_ID > $RUN_LAST_DESTINATION
+}
+
+# _run_complete [<word>...]
+# Runs from the zsh completion of run, with the words after run so far. Prints
+# a line for each word that can come next, with the destinations that it
+# matches, such as "pro:Ada's iPhone, iPhone 17 Pro". The words come from what
+# the list shows for the destinations that _run_filter keeps for the words so
+# far, and a version such as 27.0 stays one word. It leaves out the words so
+# far, words of one character, and words that all of those destinations have,
+# because they pick nothing.
+_run_complete() {
+  _run_find_repository 2>/dev/null || return 0
+  _run_read_settings
+  RUN_MAC_CATALYST=${RUN_SETTINGS[mac_catalyst]:-no}
+  DEVELOPER_DIR=$(_run_developer_dir 2>/dev/null) || return 0
+  export DEVELOPER_DIR
+  local -a rows=("${(@f)$(_run_destinations)}") typed=(${(L)@}) fields parts indexes names
+  local -A found
+  local part word text
+  local -i i
+  _run_filter "$*" $rows
+  rows=($reply)
+  for (( i = 1; i <= $#rows; i++ )); do
+    fields=("${(@ps:\t:)rows[i]}")
+    for part in ${=${(L)${(j: :)fields[3,5]}//[^[:alnum:].]/ }}; do
+      parts=(${(s:.:)part})
+      [[ $part =~ '^[0-9]+(\.[0-9]+)+$' ]] && parts=($part)
+      for word in $parts; do
+        (( $#word > 1 )) && found[$word]+=" $i"
+      done
+    done
+  done
+
+  for word in ${(k)found}; do
+    indexes=(${(u)=found[$word]})
+    (( ${typed[(Ie)$word]} || $#indexes == $#rows )) && continue
+    names=()
+    for i in $indexes; do
+      fields=("${(@ps:\t:)rows[i]}")
+      names+=($fields[3])
+    done
+    names=(${(u)names})
+    text=${(j:, :)names[1,3]}
+    (( $#names > 3 )) && text+=" +$(( $#names - 3 )) more"
+    print -r -- "$word:$text"
+  done
 }
 
 # _run_last_run
@@ -1516,6 +1578,7 @@ _run_usage() {
     '<destination>' 'Run on the destination that matches, such as mac or iphone 17.'
     --no-build 'Run the last build again on the same destination.'
     setup 'Answer the setup questions for this repository again.'
+    'completion <shell>' 'Print the Tab completion for fish or zsh. The README shows how to add it.'
     --help 'Show this help.'
     --version 'Show the version.'
   )
@@ -1527,6 +1590,76 @@ _run_usage() {
   done
   print
   print -r -- "The first run in a repository asks the setup questions."
+}
+
+# _run_completion <fish|zsh>
+# Prints the Tab completion of run and xcode-run for the shell: for
+# xcode-run completion fish | source in ~/.config/fish/config.fish, or for
+# eval "$(xcode-run completion zsh)" in ~/.zshrc after compinit. Tab after run
+# offers the words that _run_complete finds, and the commands. Upper case
+# matches lower case.
+_run_completion() {
+  case $1 in
+    fish)
+      cat <<'EOF'
+# fish completion of run and xcode-run, from: xcode-run completion fish
+function __xcode_run_words
+    set -l words (commandline -opc)
+    set -e words[1]
+    if set -q words[1]
+        string match -q -- '-*' $words[1]; and return
+        contains -- $words[1] setup completion; and return
+    end
+    xcode-run _complete $words 2>/dev/null | string replace : \t
+end
+
+for command in run xcode-run
+    complete -c $command -f
+    complete -c $command -n __fish_is_first_arg -l no-build -d 'Run the last build again on the same destination'
+    complete -c $command -n __fish_is_first_arg -l help -d 'Show the commands'
+    complete -c $command -n __fish_is_first_arg -l version -d 'Show the version'
+    complete -c $command -n __fish_is_first_arg -a setup -d 'Answer the setup questions again'
+    complete -c $command -a '(__xcode_run_words)'
+end
+EOF
+      ;;
+    zsh)
+      cat <<'EOF'
+# zsh completion of run and xcode-run, from: xcode-run completion zsh
+_xcode_run() {
+  local -a items
+  local ret=1
+  if (( CURRENT == 2 )); then
+    if [[ $PREFIX == -* ]]; then
+      items=(
+        '--no-build:run the last build again on the same destination'
+        '--help:show the commands'
+        '--version:show the version'
+      )
+      _describe -t options option items
+      return
+    fi
+    items=('setup:answer the setup questions again')
+    _describe -t commands command items && ret=0
+  elif [[ $words[2] == (-*|setup|completion) ]]; then
+    return 1
+  fi
+  items=(${(f)"$(xcode-run _complete ${(Q)words[2,CURRENT-1]} 2>/dev/null)"})
+  _describe -t destinations 'destination word' items -M 'm:{[:upper:]}={[:lower:]}' && ret=0
+  return ret
+}
+if (( $+functions[compdef] )); then
+  compdef _xcode_run run xcode-run
+else
+  print -u2 'xcode-run: put eval "$(xcode-run completion zsh)" after compinit in ~/.zshrc'
+fi
+EOF
+      ;;
+    *)
+      print -u2 "Name the shell: $RUN_COMMAND completion fish, or $RUN_COMMAND completion zsh"
+      return 2
+      ;;
+  esac
 }
 
 # _run_version
@@ -1622,11 +1755,13 @@ if [[ $ZSH_EVAL_CONTEXT == toplevel ]]; then
     '') run ;;
     --no-build) run --no-build ;;
     setup) run_setup ;;
+    completion) _run_completion $2 ;;
     -h|--help|help) _run_usage ;;
     -v|--version|version) _run_version ;;
     _export) shift; _run_export "$@" ;;
     _relaunch) _run_relaunch ;;
     _help) _run_help ;;
+    _complete) shift; _run_complete "$@" ;;
     -*)
       _run_usage >&2
       exit 2

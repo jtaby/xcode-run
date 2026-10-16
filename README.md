@@ -35,15 +35,31 @@ npm install -g xcode-run
 This installs two names for the same command: `run` and `xcode-run`. Use
 `xcode-run` if another tool already uses `run`.
 
+### Tab completion
+
+To complete destinations with Tab in fish, add this line to
+`~/.config/fish/config.fish`:
+
+```fish
+xcode-run completion fish | source
+```
+
+In zsh, add this line to `~/.zshrc`, after `compinit`:
+
+```sh
+eval "$(xcode-run completion zsh)"
+```
+
 ## Use
 
 In a git repository with an iOS app:
 
 ```sh
-run             # pick a destination, then build, run, and show the console
-run iphone 17   # build and run on the destination that matches, without the list
-run --no-build  # run the last build again on the same destination
-run setup       # answer the setup questions again
+run                  # pick a destination, then build, run, and show the console
+run iphone 17        # build and run on the destination that matches, without the list
+run --no-build       # run the last build again on the same destination
+run setup            # answer the setup questions again
+run completion fish  # print the Tab completion for fish (or zsh)
 run --help
 run --version
 ```
@@ -101,6 +117,21 @@ destination, in any case. Then:
 
 The destination that you name counts as your pick, so the list starts on it
 next time.
+
+With [Tab completion](#tab-completion), Tab after `run` offers the
+words that narrow down the destinations, with the destinations that each word
+matches. It leaves out words that all of those destinations have, so each word
+picks fewer of them. A version such as `27.0` is one word.
+
+```
+$ run iphone 17 <Tab>
+17e        -- iPhone 17e
+27.0       -- iPhone 17, iPhone 17 Pro, iPhone 17 Pro Max
+ada  usb   -- Ada's iPhone
+max        -- Ada's iPhone, iPhone 17 Pro Max
+pro        -- Ada's iPhone, iPhone 17 Pro, iPhone 17 Pro Max
+simulator  -- iPhone 17, iPhone 17e, iPhone 17 Pro +1 more
+```
 
 ### Build
 
