@@ -148,10 +148,12 @@ app's output, newest line at the bottom.
 | Key | Action |
 | --- | --- |
 | Type | Filter the lines. `!word` hides lines, `a \| b` matches either, `^word` matches the start. |
-| Esc | Clear the filter. |
+| Esc | Clear the selection, or with none, the filter. |
 | Up, PgUp | Scroll back. New lines don't move the view while you read. |
 | Down, PgDn, End | Scroll forward. On the newest line, the view follows new lines again. |
-| Ctrl-Y | Copy the lines that match the filter (or the full log) to the clipboard. |
+| Space | Select the line in focus, or clear its selection. In a filter, press Tab instead. |
+| Shift-Up, Shift-Down | Select the lines that you move over. |
+| Ctrl-Y | Copy the selected lines to the clipboard. With none, copy the lines that match the filter (or the full log). |
 | Ctrl-S | Save the same lines to a file on your Desktop. |
 | Ctrl-B | Build the app again while it runs, then stop it and launch the new build. |
 | Ctrl-R | Stop the app and launch the same build again, without building or installing it. |

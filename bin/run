@@ -1367,7 +1367,12 @@ _run_console() {
   local resume='transform:(( FZF_POS == 1 )) && [[ $FZF_PROMPT == *paused* ]] && print "toggle-track+change-prompt:Filter: "'
   # ? shows the help when the filter is empty. In a filter, it is a character.
   local help="transform:[[ -n \$FZF_QUERY ]] && print 'put(?)' || print 'execute($again _help)'"
-  local keys='?: help · ctrl-b: rebuild · ctrl-r: relaunch · ctrl-y: copy · ctrl-s: save · end: newest line · ctrl-c: stop app'
+  # Space selects the line in focus when the filter is empty. In a filter, it
+  # is a character, and Tab selects. Esc clears the selection first, then the
+  # filter.
+  local space="transform:[[ -n \$FZF_QUERY ]] && print 'put( )' || print toggle"
+  local esc='transform:(( FZF_SELECT_COUNT )) && print clear-selection || print clear-query'
+  local keys='?: help · space: select · ctrl-b: rebuild · ctrl-r: relaunch · ctrl-y: copy · ctrl-s: save · end: newest line · ctrl-c: stop app'
   # The keys that run this script again get the session from these variables.
   local -a session=(
     RUN_LOG=$log RUN_TITLE=$title RUN_SESSION=$RUN_SESSION
@@ -1379,24 +1384,28 @@ _run_console() {
   # fzf like Enter does. Ctrl-C prints nothing.
   local -a output=("${(@f)$(env $session FZF_DEFAULT_COMMAND="tail -n +1 -F ${(q)log}" fzf \
     --with-shell='zsh -fc' \
-    --tac --no-sort --exact --tail=$RUN_CONSOLE_LINES --wrap --no-multi \
+    --tac --no-sort --exact --tail=$RUN_CONSOLE_LINES --wrap --multi \
     --prompt='Filter: ' --info=inline-right --ghost='words, !hidden, a | b' \
     --print-query --query=$filter \
     --header=$keys --footer="$title${report:+ · $report}" \
-    --bind='enter:ignore,esc:clear-query' \
+    --bind='enter:ignore' \
+    --bind="esc:$esc" \
+    --bind="space:$space" \
     --bind='ctrl-b:print(rebuild)+accept' \
     --bind="up:up+$pause" \
+    --bind="shift-up:select+up+select+$pause" \
     --bind="page-up:page-up+$pause" \
     --bind="scroll-up:up+$pause" \
     --bind="down:down+$resume" \
+    --bind="shift-down:select+down+select+$resume" \
     --bind="page-down:page-down+$resume" \
     --bind="scroll-down:down+$resume" \
     --bind="end:first+$resume" \
     --bind="ctrl-r:first+$resume" \
     --bind="ctrl-r:+bg-transform-footer:$again _relaunch" \
     --bind="?:$help" \
-    --bind="ctrl-y:transform-footer:$again _export copy {*f}" \
-    --bind="ctrl-s:transform-footer:$again _export save {*f}")}")
+    --bind="ctrl-y:transform-footer:$again _export copy {*f} {+nf} {+f}" \
+    --bind="ctrl-s:transform-footer:$again _export save {*f} {+nf} {+f}")}")
   [[ $output[2] == rebuild ]] || return 1
   REPLY=$output[1]
 }
@@ -1444,14 +1453,22 @@ _run_rebuild() {
   REPLY="Built and relaunched $RUN_APP_NAME at $(date +%H:%M:%S)"
 }
 
-# _run_export <copy|save> <matches-file>
+# _run_export <copy|save> <matches-file> <selected-indexes-file> <selected-file>
 # Runs from the console's Ctrl-Y and Ctrl-S. Copies to the clipboard, or saves
-# to a file, the lines that match the filter. With no filter, it uses the full
-# log. Prints the console title with a short report, for the fzf footer.
+# to a file, the selected lines. With no selection, it uses the lines that
+# match the filter, and with no filter, the full log. Prints the console title
+# with a short report, for the fzf footer.
 _run_export() {
-  local action=$1 matches=$2 source=$RUN_LOG what file report
+  local action=$1 matches=$2 indexes=$3 selected=$4 source=$RUN_LOG what file report
   local -i count
-  if [[ -n $FZF_QUERY ]]; then
+  if (( FZF_SELECT_COUNT )); then
+    # fzf lists the lines in the order of selection. Sort them by their index
+    # to put them in log order.
+    source=$(mktemp -t xcode-run-console)
+    paste $indexes $selected | sort -n -s -k 1,1 | cut -f 2- > $source
+    count=$(wc -l < $source)
+    what="$count selected line${${count:#1}:+s}"
+  elif [[ -n $FZF_QUERY ]]; then
     # --tac lists the newest line first. Put the lines back in log order.
     source=$(mktemp -t xcode-run-console)
     tail -r $matches > $source
@@ -1524,14 +1541,18 @@ _run_help() {
                   !word   hide the lines that contain word
                   a | b   show the lines that contain a or b
                   ^word   show the lines that start with word
-  ${bold}Esc${plain}           Clear the filter.
+  ${bold}Esc${plain}           Clear the selection, or with none, the filter.
   ${bold}Up, PgUp${plain}      Scroll back. The prompt shows \"paused\", and new lines
                 do not move the view.
   ${bold}Down, PgDn${plain}    Scroll forward. On the newest line, the view follows
                 new lines again.
   ${bold}End${plain}           Go to the newest line and follow new lines.
-  ${bold}Ctrl-Y${plain}        Copy the lines that match the filter to the clipboard.
-                With no filter, copy the full log.
+  ${bold}Space${plain}         Select the line in focus, or clear its selection. In a
+                filter, Space is a usual character, and Tab selects.
+  ${bold}Shift-Up/Down${plain} Select the lines that you move over.
+  ${bold}Ctrl-Y${plain}        Copy the selected lines to the clipboard. With none,
+                copy the lines that match the filter, and with no filter,
+                copy the full log.
   ${bold}Ctrl-S${plain}        Save the same lines to a file in ${RUN_SAVE_DIR/#$HOME/~}.
   ${bold}Ctrl-B${plain}        Build the app again while it runs, then stop it and
                 launch the new build. If the build fails, the app keeps
