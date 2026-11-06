@@ -111,8 +111,8 @@ RUN_PROJECT_SEARCH_DEPTH=3
 RUN_SCRIPT=${0:A}
 # The name that started the script, run or xcode-run, for messages.
 RUN_COMMAND=${0:t}
-# Oldest fzf with the features that the console uses: --footer and {*f}.
-RUN_FZF_MIN_VERSION=0.63.0
+# Oldest fzf with the features that the console uses: --footer, {*f}, and every.
+RUN_FZF_MIN_VERSION=0.73.0
 
 # Patterns for the lines that _run_progress prints.
 RUN_STEP_PATTERN='\[*'
@@ -843,6 +843,39 @@ _run_match() {
   reply=($matches)
 }
 
+# _run_pick_lines [<row>...]
+# Prints each row of _run_destinations, then what the list shows for it: the
+# type, name, and details in columns.
+_run_pick_lines() {
+  local row
+  local -a fields
+  local -i type_width name_width
+  for row in "$@"; do
+    fields=("${(@ps:\t:)row}")
+    (( ${#fields[4]} > type_width )) && type_width=${#fields[4]}
+    (( ${#fields[3]} > name_width )) && name_width=${#fields[3]}
+  done
+  for row in "$@"; do
+    fields=("${(@ps:\t:)row}")
+    print -r -- "$row"$'\t\e[2m'"${(r:type_width:)fields[4]}"$'\e[0m  '"${(r:name_width:)fields[3]}"$'  \e[2m'"$fields[5]"$'\e[0m'
+  done
+}
+
+# _run_pick_update <file> [<query>]
+# Runs from the list in fzf. If the destinations changed, writes their lines to
+# the file and prints the fzf action that reloads the list from it.
+_run_pick_update() {
+  local -a rows=("${(@f)$(_run_destinations)}")
+  local lines
+  if [[ -n $2 ]]; then
+    _run_match $2 $rows
+    (( $#reply )) && rows=($reply)
+  fi
+  lines=$(_run_pick_lines $rows)
+  [[ $lines == "$(<$1)" ]] && return
+  print -r -- $lines > $1 && print -r -- "reload-sync(cat ${(q)1})"
+}
+
 # _run_pick [<query>]
 # Sets RUN_KIND, RUN_ID, and RUN_NAME to the destination that the user picks
 # from a list in fzf, which starts on the last destination. With a query, such
@@ -851,8 +884,8 @@ _run_match() {
 # does, it shows all.
 _run_pick() {
   local -a rows=("${(@f)$(_run_destinations)}") fields lines
-  local row last choice
-  local -i type_width name_width selected=1 i
+  local last choice query list
+  local -i selected=1 i
   if [[ -n $1 ]]; then
     _run_match $1 $rows
     if (( $#reply == 1 )); then
@@ -860,31 +893,29 @@ _run_pick() {
     elif (( $#reply )); then
       print -u2 -r -- "$#reply destinations match \"$1\""
       rows=($reply)
+      query=$1
     else
       print -u2 -r -- "No destination matches \"$1\""
     fi
   fi
 
   if [[ -z $choice ]]; then
-    for row in $rows; do
-      fields=("${(@ps:\t:)row}")
-      (( ${#fields[4]} > type_width )) && type_width=${#fields[4]}
-      (( ${#fields[3]} > name_width )) && name_width=${#fields[3]}
-    done
     [[ -r $RUN_LAST_DESTINATION ]] && last=$(<$RUN_LAST_DESTINATION)
     for (( i = 1; i <= $#rows; i++ )); do
       fields=("${(@ps:\t:)rows[i]}")
       [[ $fields[2] == "$last" ]] && selected=i
-      # fzf shows only the 2nd field: the type, name, and details in columns.
-      # The 1st is the number of the row.
-      lines+=("$i"$'\t\e[2m'"${(r:type_width:)fields[4]}"$'\e[0m  '"${(r:name_width:)fields[3]}"$'  \e[2m'"$fields[5]"$'\e[0m')
     done
+    lines=("${(@f)$(_run_pick_lines $rows)}")
+    list=$(mktemp -t xcode-run-list) && print -rl -- $lines > $list || return 1
 
     choice=$(print -rl -- $lines | fzf --ansi --no-sort --exact --layout=reverse \
-      --height=$RUN_PICKER_HEIGHT --delimiter='\t' --with-nth=2 \
+      --height=$RUN_PICKER_HEIGHT --delimiter='\t' --with-nth=7 --track --id-nth=2 \
       --prompt="Run $RUN_APP_NAME on: " --header='enter: build and run · esc: cancel' \
-      --bind="load:pos($selected)") || return 1
-    choice=$rows[${choice%%$'\t'*}]
+      --bind="load:pos($selected)+unbind(load)" --with-shell='zsh -fc' \
+      --bind="every(2):bg-transform:RUN_MAC_CATALYST=$RUN_MAC_CATALYST zsh -f ${(q)RUN_SCRIPT} _pick_update ${(q)list} ${(q)query}")
+    rm -f $list
+    [[ -n $choice ]] || return 1
+    choice=${choice%$'\t'*}
   fi
   fields=("${(@ps:\t:)choice}")
   RUN_KIND=$fields[1] RUN_ID=$fields[2] RUN_NAME=$fields[3]
@@ -1783,6 +1814,7 @@ if [[ $ZSH_EVAL_CONTEXT == toplevel ]]; then
     _relaunch) _run_relaunch ;;
     _help) _run_help ;;
     _complete) shift; _run_complete "$@" ;;
+    _pick_update) shift; _run_pick_update "$@" ;;
     -*)
       _run_usage >&2
       exit 2

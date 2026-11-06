@@ -19,7 +19,7 @@ checkout instead of downloading them again.
 ## Requirements
 
 - macOS with Xcode
-- [fzf](https://github.com/junegunn/fzf) 0.63.0 or newer
+- [fzf](https://github.com/junegunn/fzf) 0.73.0 or newer
 - [jq](https://jqlang.org)
 
 ```sh
